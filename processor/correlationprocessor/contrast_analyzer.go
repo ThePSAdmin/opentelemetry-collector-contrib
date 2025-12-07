@@ -553,6 +553,9 @@ func (ca *ContrastAnalyzer) KLDivergence(attrName string) float64 {
 	}
 
 	totalNonAnomaly := ca.totalBaseline - ca.totalAnomaly
+	if totalNonAnomaly == 0 {
+		return 0
+	}
 
 	kl := 0.0
 	for _, vc := range stats.ValueCounts {
