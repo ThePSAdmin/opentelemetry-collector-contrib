@@ -97,6 +97,10 @@ type ContrastAnalyzerConfig struct {
 
 	// DecayFactor for time-based decay (0.0-1.0).
 	DecayFactor float64
+
+	// WindowSize is the maximum number of samples to keep in the sliding window.
+	// When exceeded, older samples are decayed out proportionally.
+	WindowSize int
 }
 
 // NewContrastAnalyzer creates a new contrast analyzer with the given configuration.
@@ -152,6 +156,57 @@ func (ca *ContrastAnalyzer) RecordObservation(attributes map[string]string, isAn
 		stats.TotalCount++
 		if isAnomaly {
 			vc.AnomalyCount++
+		}
+
+		stats.mutex.Unlock()
+	}
+
+	// Enforce sliding window by applying decay when we exceed the window size
+	ca.enforceWindowSize()
+}
+
+// enforceWindowSize applies decay when the total sample count exceeds the configured window size.
+// This creates an approximate sliding window effect without storing individual samples.
+// Must be called while holding ca.mutex.
+func (ca *ContrastAnalyzer) enforceWindowSize() {
+	windowSize := ca.config.WindowSize
+	if windowSize <= 0 {
+		return // No window limit configured
+	}
+
+	// Check if we've exceeded the window size
+	if ca.totalBaseline <= int64(windowSize) {
+		return
+	}
+
+	// Calculate decay factor to bring us back to window size
+	// We want: totalBaseline * decayFactor = windowSize
+	decayFactor := float64(windowSize) / float64(ca.totalBaseline)
+
+	// Apply decay to totals
+	ca.totalBaseline = int64(windowSize)
+	ca.totalAnomaly = int64(float64(ca.totalAnomaly) * decayFactor)
+
+	// Apply decay to per-attribute statistics
+	for _, stats := range ca.attributeStats {
+		stats.mutex.Lock()
+
+		stats.TotalCount = int64(float64(stats.TotalCount) * decayFactor)
+
+		// Decay value counts and remove values with count < 1
+		toRemove := make([]string, 0)
+		for value, vc := range stats.ValueCounts {
+			vc.BaselineCount = int64(float64(vc.BaselineCount) * decayFactor)
+			vc.AnomalyCount = int64(float64(vc.AnomalyCount) * decayFactor)
+
+			// Remove values that have decayed to zero
+			if vc.BaselineCount < 1 {
+				toRemove = append(toRemove, value)
+			}
+		}
+
+		for _, value := range toRemove {
+			delete(stats.ValueCounts, value)
 		}
 
 		stats.mutex.Unlock()
@@ -426,7 +481,7 @@ func (ca *ContrastAnalyzer) ApplyDecay() {
 	}
 }
 
-// GetStatistics returns current statistics for monitoring/debugging.
+// AnalyzerStatistics returns current statistics for monitoring/debugging.
 type AnalyzerStatistics struct {
 	TotalBaseline      int64
 	TotalAnomaly       int64
@@ -436,6 +491,8 @@ type AnalyzerStatistics struct {
 	ReadyForAnalysis   bool
 	MinBaselineReached bool
 	MinAnomalyReached  bool
+	WindowSize         int
+	WindowUtilization  float64 // Percentage of window currently used
 }
 
 // GetStatistics returns current analyzer statistics.
@@ -449,10 +506,19 @@ func (ca *ContrastAnalyzer) GetStatistics() AnalyzerStatistics {
 		AttributesTracked:  len(ca.attributeStats),
 		MinBaselineReached: ca.totalBaseline >= int64(ca.config.MinBaselineSamples),
 		MinAnomalyReached:  ca.totalAnomaly >= int64(ca.config.MinAnomalySamples),
+		WindowSize:         ca.config.WindowSize,
 	}
 
 	if ca.totalBaseline > 0 {
 		stats.AnomalyRate = float64(ca.totalAnomaly) / float64(ca.totalBaseline)
+	}
+
+	// Calculate window utilization
+	if ca.config.WindowSize > 0 {
+		stats.WindowUtilization = float64(ca.totalBaseline) / float64(ca.config.WindowSize) * 100.0
+		if stats.WindowUtilization > 100.0 {
+			stats.WindowUtilization = 100.0
+		}
 	}
 
 	stats.ReadyForAnalysis = stats.MinBaselineReached && stats.MinAnomalyReached

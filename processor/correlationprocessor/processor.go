@@ -47,6 +47,7 @@ func newCorrelationProcessor(config *Config, logger *zap.Logger) (*correlationPr
 		MinAnomalySamples:  config.MinAnomalySamples,
 		MinBaselineSamples: config.MinBaselineSamples,
 		DecayFactor:        config.DecayFactor,
+		WindowSize:         config.BaselineWindow,
 	}
 
 	processor := &correlationProcessor{
