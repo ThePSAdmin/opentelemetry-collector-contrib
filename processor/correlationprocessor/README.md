@@ -82,7 +82,7 @@ processors:
 
     # Output settings
     output_top_k: 5              # Number of top factors to include
-    min_lift: 1.5                # Minimum lift to report
+    min_lift: 1.5                # Minimum lift for over-represented (also applies as 1/min_lift for under-represented)
     min_confidence: 0.95         # Minimum chi-squared confidence
 
     # Memory management
@@ -225,6 +225,12 @@ Where:
 - P(value | anomaly) = count(value in anomalies) / total_anomalies
 - P(value | baseline) = count(value in all) / total_all
 ```
+
+**Symmetric thresholds**: The `min_lift` setting applies symmetrically to capture both over-represented and under-represented factors:
+- Over-represented: `lift >= min_lift` (e.g., lift >= 1.5)
+- Under-represented: `lift <= 1/min_lift` (e.g., lift <= 0.667)
+
+This ensures factors that are significantly *absent* from anomalies (like cache hits) are surfaced alongside factors that are over-present.
 
 ### Chi-Squared Test
 
