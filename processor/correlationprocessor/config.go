@@ -226,8 +226,12 @@ func (cfg *Config) Validate() error {
 
 	// Validate decay settings
 	if cfg.DecayInterval != "" {
-		if _, err := time.ParseDuration(cfg.DecayInterval); err != nil {
+		d, err := time.ParseDuration(cfg.DecayInterval)
+		if err != nil {
 			return fmt.Errorf("decay_interval is not a valid duration: %w", err)
+		}
+		if d <= 0 {
+			return errors.New("decay_interval must be a positive duration")
 		}
 	}
 
