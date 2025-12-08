@@ -6,7 +6,9 @@ package correlationprocessor // import "github.com/open-telemetry/opentelemetry-
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,8 +26,13 @@ type correlationProcessor struct {
 	config *Config
 	logger *zap.Logger
 
-	// Contrast analyzer for statistical analysis
+	// Global contrast analyzer (used when partition_by is empty or as fallback)
 	analyzer *ContrastAnalyzer
+
+	// Partitioned analyzers keyed by partition key string
+	// Key format: "attr1=val1,attr2=val2" (sorted alphabetically)
+	partitionedAnalyzers map[string]*ContrastAnalyzer
+	analyzerMutex        sync.RWMutex
 
 	// Background decay management
 	decayTicker *time.Ticker
@@ -51,10 +58,11 @@ func newCorrelationProcessor(config *Config, logger *zap.Logger) (*correlationPr
 	}
 
 	processor := &correlationProcessor{
-		config:   config,
-		logger:   logger,
-		analyzer: NewContrastAnalyzer(analyzerConfig),
-		stopChan: make(chan struct{}),
+		config:               config,
+		logger:               logger,
+		analyzer:             NewContrastAnalyzer(analyzerConfig),
+		partitionedAnalyzers: make(map[string]*ContrastAnalyzer),
+		stopChan:             make(chan struct{}),
 	}
 
 	return processor, nil
@@ -94,11 +102,16 @@ func (p *correlationProcessor) Shutdown(_ context.Context) error {
 
 	// Log final statistics
 	stats := p.analyzer.GetStatistics()
+	p.analyzerMutex.RLock()
+	partitionCount := len(p.partitionedAnalyzers)
+	p.analyzerMutex.RUnlock()
+
 	p.logger.Info("Correlation processor shutdown complete",
 		zap.Int64("total_processed", stats.TotalBaseline),
 		zap.Int64("total_anomalies", stats.TotalAnomaly),
 		zap.Float64("anomaly_rate", stats.AnomalyRate),
 		zap.Int("attributes_tracked", stats.AttributesTracked),
+		zap.Int("partition_count", partitionCount),
 	)
 
 	return nil
@@ -109,7 +122,16 @@ func (p *correlationProcessor) decayLoop() {
 	for {
 		select {
 		case <-p.decayTicker.C:
+			// Apply decay to global analyzer
 			p.analyzer.ApplyDecay()
+
+			// Apply decay to all partitioned analyzers
+			p.analyzerMutex.RLock()
+			for _, analyzer := range p.partitionedAnalyzers {
+				analyzer.ApplyDecay()
+			}
+			p.analyzerMutex.RUnlock()
+
 			p.logger.Debug("Applied decay to Correlation statistics")
 		case <-p.stopChan:
 			return
@@ -261,8 +283,8 @@ func (p *correlationProcessor) processTraces(ctx context.Context, td ptrace.Trac
 				// Extract attributes for analysis
 				extractedAttrs := p.extractAttributes(spanAttrs, resourceAttrs, "traces")
 
-				// Record observation
-				p.analyzer.RecordObservation(extractedAttrs, isAnomaly)
+				// Record observation and enrich if anomalous (with partition support)
+				p.recordAndEnrich(spanAttrs, resourceAttrs, extractedAttrs, isAnomaly)
 
 				// Update stats
 				p.statsMutex.Lock()
@@ -271,14 +293,6 @@ func (p *correlationProcessor) processTraces(ctx context.Context, td ptrace.Trac
 					p.anomalyCount++
 				}
 				p.statsMutex.Unlock()
-
-				// If anomalous, enrich with contributing factors
-				if isAnomaly {
-					factors := p.analyzer.GetContributingFactors(p.config.OutputTopK)
-					if len(factors) > 0 {
-						p.enrichWithFactors(spanAttrs, factors)
-					}
-				}
 			}
 		}
 	}
@@ -314,7 +328,9 @@ func (p *correlationProcessor) processMetricDataPoints(metric pmetric.Metric, re
 	processDataPoint := func(attrs pcommon.Map) {
 		isAnomaly := p.isAnomaly(attrs)
 		extractedAttrs := p.extractAttributes(attrs, resourceAttrs, "metrics")
-		p.analyzer.RecordObservation(extractedAttrs, isAnomaly)
+
+		// Record observation and enrich if anomalous (with partition support)
+		p.recordAndEnrich(attrs, resourceAttrs, extractedAttrs, isAnomaly)
 
 		p.statsMutex.Lock()
 		p.processedCount++
@@ -322,13 +338,6 @@ func (p *correlationProcessor) processMetricDataPoints(metric pmetric.Metric, re
 			p.anomalyCount++
 		}
 		p.statsMutex.Unlock()
-
-		if isAnomaly {
-			factors := p.analyzer.GetContributingFactors(p.config.OutputTopK)
-			if len(factors) > 0 {
-				p.enrichWithFactors(attrs, factors)
-			}
-		}
 	}
 
 	switch metric.Type() {
@@ -378,8 +387,8 @@ func (p *correlationProcessor) processLogs(ctx context.Context, ld plog.Logs) (p
 				// Extract attributes for analysis
 				extractedAttrs := p.extractAttributes(logAttrs, resourceAttrs, "logs")
 
-				// Record observation
-				p.analyzer.RecordObservation(extractedAttrs, isAnomaly)
+				// Record observation and enrich if anomalous (with partition support)
+				p.recordAndEnrich(logAttrs, resourceAttrs, extractedAttrs, isAnomaly)
 
 				// Update stats
 				p.statsMutex.Lock()
@@ -388,14 +397,6 @@ func (p *correlationProcessor) processLogs(ctx context.Context, ld plog.Logs) (p
 					p.anomalyCount++
 				}
 				p.statsMutex.Unlock()
-
-				// If anomalous, enrich with contributing factors
-				if isAnomaly {
-					factors := p.analyzer.GetContributingFactors(p.config.OutputTopK)
-					if len(factors) > 0 {
-						p.enrichWithFactors(logAttrs, factors)
-					}
-				}
 			}
 		}
 	}
@@ -416,5 +417,100 @@ func valueToString(v pcommon.Value) string {
 		return strconv.FormatBool(v.Bool())
 	default:
 		return v.AsString()
+	}
+}
+
+// buildPartitionKey extracts partition attribute values and builds a canonical key.
+// Returns (key, true) if all partition attributes found, ("", false) otherwise.
+func (p *correlationProcessor) buildPartitionKey(attrs pcommon.Map, resourceAttrs pcommon.Map) (string, bool) {
+	if len(p.config.PartitionBy) == 0 {
+		return "", false
+	}
+
+	values := make([]string, 0, len(p.config.PartitionBy))
+	for _, attrName := range p.config.PartitionBy {
+		val, found := attrs.Get(attrName)
+		if !found {
+			val, found = resourceAttrs.Get(attrName)
+		}
+		if !found {
+			return "", false // Missing attribute - fallback to global
+		}
+		values = append(values, attrName+"="+valueToString(val))
+	}
+
+	sort.Strings(values) // Ensure consistent key regardless of config order
+	return strings.Join(values, ","), true
+}
+
+// getOrCreatePartitionedAnalyzer returns the analyzer for a partition key.
+func (p *correlationProcessor) getOrCreatePartitionedAnalyzer(partitionKey string) *ContrastAnalyzer {
+	p.analyzerMutex.RLock()
+	analyzer, exists := p.partitionedAnalyzers[partitionKey]
+	p.analyzerMutex.RUnlock()
+
+	if exists {
+		return analyzer
+	}
+
+	p.analyzerMutex.Lock()
+	defer p.analyzerMutex.Unlock()
+
+	// Double-check after acquiring write lock
+	if analyzer, exists = p.partitionedAnalyzers[partitionKey]; exists {
+		return analyzer
+	}
+
+	analyzerConfig := &ContrastAnalyzerConfig{
+		CardinalityLimit:   p.config.CardinalityLimit,
+		MinLift:            p.config.MinLift,
+		MinConfidence:      p.config.MinConfidence,
+		MinAnomalySamples:  p.config.MinAnomalySamples,
+		MinBaselineSamples: p.config.MinBaselineSamples,
+		DecayFactor:        p.config.DecayFactor,
+		WindowSize:         p.config.BaselineWindow,
+	}
+	analyzer = NewContrastAnalyzer(analyzerConfig)
+	p.partitionedAnalyzers[partitionKey] = analyzer
+
+	return analyzer
+}
+
+// recordAndEnrich handles recording observations and enriching anomalies with partition support.
+func (p *correlationProcessor) recordAndEnrich(
+	attrs pcommon.Map,
+	resourceAttrs pcommon.Map,
+	extractedAttrs map[string]string,
+	isAnomaly bool,
+) {
+	partitionKey, hasPartition := p.buildPartitionKey(attrs, resourceAttrs)
+
+	// Always record to global analyzer
+	p.analyzer.RecordObservation(extractedAttrs, isAnomaly)
+
+	// Also record to partitioned analyzer if applicable
+	var partitionedAnalyzer *ContrastAnalyzer
+	if hasPartition {
+		partitionedAnalyzer = p.getOrCreatePartitionedAnalyzer(partitionKey)
+		partitionedAnalyzer.RecordObservation(extractedAttrs, isAnomaly)
+	}
+
+	// Enrich anomalies with contributing factors
+	if isAnomaly {
+		var factors []ContributingFactor
+
+		// Try partition-specific factors first
+		if partitionedAnalyzer != nil {
+			factors = partitionedAnalyzer.GetContributingFactors(p.config.OutputTopK)
+		}
+
+		// Fall back to global if partition has insufficient samples
+		if len(factors) == 0 {
+			factors = p.analyzer.GetContributingFactors(p.config.OutputTopK)
+		}
+
+		if len(factors) > 0 {
+			p.enrichWithFactors(attrs, factors)
+		}
 	}
 }

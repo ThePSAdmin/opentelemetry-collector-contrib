@@ -94,7 +94,43 @@ processors:
 
     # Output attribute prefix
     output_attribute_prefix: "correlation"
+
+    # Optional: Partition analysis by attribute values
+    # partition_by:
+    #   - service.name
+    #   - k8s.namespace.name
 ```
+
+## Partitioned Analysis
+
+By default, the correlation processor compares anomalies against ALL baseline telemetry.
+Use `partition_by` to scope analysis to telemetry with matching attribute values:
+
+```yaml
+processors:
+  correlation:
+    # Analyze each service independently
+    partition_by:
+      - service.name
+      - k8s.namespace.name
+    # ... other config
+```
+
+### Behavior
+
+- Anomalies are compared only against baseline telemetry with the **same values** for ALL partition attributes (AND logic)
+- If an anomaly is **missing any** partition attribute, it falls back to global comparison
+- Useful for multi-tenant environments or when services have different baseline patterns
+
+### Example
+
+With `partition_by: [service.name]`:
+- An anomaly from `service.name=api-service` compares only against other `api-service` telemetry
+- An anomaly missing `service.name` compares against all telemetry (global fallback)
+
+### Memory Considerations
+
+Each unique combination of partition values creates a separate analyzer instance. Choose partition attributes with bounded cardinality to avoid memory issues.
 
 ## Example: Pipeline with Anomaly Detection
 

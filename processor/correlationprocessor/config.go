@@ -58,6 +58,13 @@ type Config struct {
 
 	// OutputAttributePrefix is the prefix for output attributes.
 	OutputAttributePrefix string `mapstructure:"output_attribute_prefix"`
+
+	// PartitionBy specifies attributes to partition the correlation analysis by.
+	// When set, anomalies are compared only against baseline telemetry with
+	// matching values for ALL specified partition attributes (AND logic).
+	// If an anomaly is missing any partition attribute, it falls back to global comparison.
+	// Example: ["service.name", "k8s.namespace.name"]
+	PartitionBy []string `mapstructure:"partition_by"`
 }
 
 // AnomalyConditionConfig defines how to identify anomalous telemetry.
@@ -160,6 +167,8 @@ func createDefaultConfig() component.Config {
 		DecayFactor:        0.95,
 
 		OutputAttributePrefix: "correlation",
+
+		PartitionBy: []string{},
 	}
 }
 

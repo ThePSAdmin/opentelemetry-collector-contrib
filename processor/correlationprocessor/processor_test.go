@@ -1086,3 +1086,406 @@ func TestProcessorStatistics(t *testing.T) {
 	assert.Equal(t, uint64(4), proc.anomalyCount) // 0, 3, 6, 9
 	proc.statsMutex.Unlock()
 }
+
+func TestBuildPartitionKey(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		partitionBy    []string
+		attrs          map[string]interface{}
+		resourceAttrs  map[string]interface{}
+		expectedKey    string
+		expectedFound  bool
+	}{
+		{
+			name:          "no_partition_config",
+			partitionBy:   []string{},
+			expectedKey:   "",
+			expectedFound: false,
+		},
+		{
+			name:        "single_partition_found_in_attrs",
+			partitionBy: []string{"service.name"},
+			attrs:       map[string]interface{}{"service.name": "api-service"},
+			expectedKey: "service.name=api-service",
+			expectedFound: true,
+		},
+		{
+			name:        "single_partition_found_in_resource",
+			partitionBy: []string{"service.name"},
+			attrs:       map[string]interface{}{},
+			resourceAttrs: map[string]interface{}{"service.name": "api-service"},
+			expectedKey:   "service.name=api-service",
+			expectedFound: true,
+		},
+		{
+			name:        "multiple_partitions_found_sorted",
+			partitionBy: []string{"k8s.namespace.name", "service.name"},
+			attrs:       map[string]interface{}{"service.name": "api-service", "k8s.namespace.name": "prod"},
+			expectedKey: "k8s.namespace.name=prod,service.name=api-service",
+			expectedFound: true,
+		},
+		{
+			name:          "missing_partition_attribute",
+			partitionBy:   []string{"service.name", "missing.attr"},
+			attrs:         map[string]interface{}{"service.name": "api-service"},
+			expectedKey:   "",
+			expectedFound: false,
+		},
+		{
+			name:        "attr_takes_precedence_over_resource",
+			partitionBy: []string{"service.name"},
+			attrs:       map[string]interface{}{"service.name": "span-service"},
+			resourceAttrs: map[string]interface{}{"service.name": "resource-service"},
+			expectedKey:   "service.name=span-service",
+			expectedFound: true,
+		},
+		{
+			name:        "integer_value",
+			partitionBy: []string{"http.status_code"},
+			attrs:       map[string]interface{}{"http.status_code": int64(500)},
+			expectedKey: "http.status_code=500",
+			expectedFound: true,
+		},
+		{
+			name:        "bool_value",
+			partitionBy: []string{"cache.hit"},
+			attrs:       map[string]interface{}{"cache.hit": true},
+			expectedKey: "cache.hit=true",
+			expectedFound: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			proc := newTestProcessor(t, &Config{
+				AnomalyConditions: AnomalyConditionConfig{
+					AttributeName:  "anomaly.is_anomaly",
+					AttributeValue: "true",
+				},
+				AnalyzeAttributes: AnalyzeAttributesConfig{
+					Traces: []string{"http.method"},
+				},
+				PartitionBy:           tt.partitionBy,
+				BaselineWindow:        10000,
+				MinAnomalySamples:     50,
+				MinBaselineSamples:    500,
+				OutputTopK:            5,
+				MinLift:               1.5,
+				MinConfidence:         0.95,
+				CardinalityLimit:      1000,
+				DecayFactor:           0.95,
+				OutputAttributePrefix: "correlation",
+			})
+
+			attrs := pcommon.NewMap()
+			for k, v := range tt.attrs {
+				switch val := v.(type) {
+				case string:
+					attrs.PutStr(k, val)
+				case int64:
+					attrs.PutInt(k, val)
+				case bool:
+					attrs.PutBool(k, val)
+				}
+			}
+
+			resourceAttrs := pcommon.NewMap()
+			for k, v := range tt.resourceAttrs {
+				switch val := v.(type) {
+				case string:
+					resourceAttrs.PutStr(k, val)
+				case int64:
+					resourceAttrs.PutInt(k, val)
+				case bool:
+					resourceAttrs.PutBool(k, val)
+				}
+			}
+
+			key, found := proc.buildPartitionKey(attrs, resourceAttrs)
+			assert.Equal(t, tt.expectedKey, key)
+			assert.Equal(t, tt.expectedFound, found)
+		})
+	}
+}
+
+func TestPartitionedAnalysis_CreatesPartitionedAnalyzer(t *testing.T) {
+	t.Parallel()
+
+	proc := newTestProcessor(t, &Config{
+		AnomalyConditions: AnomalyConditionConfig{
+			AttributeName:  "anomaly.is_anomaly",
+			AttributeValue: "true",
+		},
+		AnalyzeAttributes: AnalyzeAttributesConfig{
+			Traces:   []string{"http.method"},
+			Resource: []string{"service.name"},
+		},
+		PartitionBy:           []string{"service.name"},
+		BaselineWindow:        10000,
+		MinAnomalySamples:     50,
+		MinBaselineSamples:    500,
+		OutputTopK:            5,
+		MinLift:               1.5,
+		MinConfidence:         0.95,
+		CardinalityLimit:      1000,
+		DecayFactor:           0.95,
+		OutputAttributePrefix: "correlation",
+	})
+
+	// Process traces with two different services
+	td := ptrace.NewTraces()
+
+	// Service A spans
+	rs1 := td.ResourceSpans().AppendEmpty()
+	rs1.Resource().Attributes().PutStr("service.name", "service-a")
+	ss1 := rs1.ScopeSpans().AppendEmpty()
+	for i := 0; i < 5; i++ {
+		span := ss1.Spans().AppendEmpty()
+		span.SetName("test-span")
+		span.Attributes().PutStr("http.method", "GET")
+		span.Attributes().PutBool("anomaly.is_anomaly", false)
+	}
+
+	// Service B spans
+	rs2 := td.ResourceSpans().AppendEmpty()
+	rs2.Resource().Attributes().PutStr("service.name", "service-b")
+	ss2 := rs2.ScopeSpans().AppendEmpty()
+	for i := 0; i < 5; i++ {
+		span := ss2.Spans().AppendEmpty()
+		span.SetName("test-span")
+		span.Attributes().PutStr("http.method", "POST")
+		span.Attributes().PutBool("anomaly.is_anomaly", false)
+	}
+
+	_, err := proc.processTraces(context.Background(), td)
+	require.NoError(t, err)
+
+	// Verify partitioned analyzers were created
+	proc.analyzerMutex.RLock()
+	assert.Equal(t, 2, len(proc.partitionedAnalyzers))
+	_, hasServiceA := proc.partitionedAnalyzers["service.name=service-a"]
+	_, hasServiceB := proc.partitionedAnalyzers["service.name=service-b"]
+	proc.analyzerMutex.RUnlock()
+
+	assert.True(t, hasServiceA, "Expected partitioned analyzer for service-a")
+	assert.True(t, hasServiceB, "Expected partitioned analyzer for service-b")
+}
+
+func TestPartitionedAnalysis_MissingAttribute_FallsBackToGlobal(t *testing.T) {
+	t.Parallel()
+
+	proc := newTestProcessor(t, &Config{
+		AnomalyConditions: AnomalyConditionConfig{
+			AttributeName:  "anomaly.is_anomaly",
+			AttributeValue: "true",
+		},
+		AnalyzeAttributes: AnalyzeAttributesConfig{
+			Traces:   []string{"http.method"},
+			Resource: []string{"service.name"},
+		},
+		PartitionBy:           []string{"service.name"},
+		BaselineWindow:        10000,
+		MinAnomalySamples:     50,
+		MinBaselineSamples:    500,
+		OutputTopK:            5,
+		MinLift:               1.5,
+		MinConfidence:         0.95,
+		CardinalityLimit:      1000,
+		DecayFactor:           0.95,
+		OutputAttributePrefix: "correlation",
+	})
+
+	// Process traces with a span that doesn't have the partition attribute
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	// Note: NOT setting service.name
+	ss := rs.ScopeSpans().AppendEmpty()
+	span := ss.Spans().AppendEmpty()
+	span.SetName("test-span")
+	span.Attributes().PutStr("http.method", "GET")
+	span.Attributes().PutBool("anomaly.is_anomaly", false)
+
+	_, err := proc.processTraces(context.Background(), td)
+	require.NoError(t, err)
+
+	// Verify no partitioned analyzer was created (should use global)
+	proc.analyzerMutex.RLock()
+	assert.Equal(t, 0, len(proc.partitionedAnalyzers))
+	proc.analyzerMutex.RUnlock()
+
+	// Verify global analyzer received the observation
+	globalStats := proc.analyzer.GetStatistics()
+	assert.Equal(t, int64(1), globalStats.TotalBaseline)
+}
+
+func TestPartitionedAnalysis_BackwardCompatibility(t *testing.T) {
+	t.Parallel()
+
+	// Empty PartitionBy should behave like no partitioning
+	proc := newTestProcessor(t, &Config{
+		AnomalyConditions: AnomalyConditionConfig{
+			AttributeName:  "anomaly.is_anomaly",
+			AttributeValue: "true",
+		},
+		AnalyzeAttributes: AnalyzeAttributesConfig{
+			Traces:   []string{"http.method"},
+			Resource: []string{"service.name"},
+		},
+		PartitionBy:           []string{}, // Empty - backward compatible
+		BaselineWindow:        10000,
+		MinAnomalySamples:     50,
+		MinBaselineSamples:    500,
+		OutputTopK:            5,
+		MinLift:               1.5,
+		MinConfidence:         0.95,
+		CardinalityLimit:      1000,
+		DecayFactor:           0.95,
+		OutputAttributePrefix: "correlation",
+	})
+
+	// Process traces
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("service.name", "test-service")
+	ss := rs.ScopeSpans().AppendEmpty()
+	for i := 0; i < 10; i++ {
+		span := ss.Spans().AppendEmpty()
+		span.SetName("test-span")
+		span.Attributes().PutStr("http.method", "GET")
+		span.Attributes().PutBool("anomaly.is_anomaly", false)
+	}
+
+	_, err := proc.processTraces(context.Background(), td)
+	require.NoError(t, err)
+
+	// Verify no partitioned analyzers were created
+	proc.analyzerMutex.RLock()
+	assert.Equal(t, 0, len(proc.partitionedAnalyzers))
+	proc.analyzerMutex.RUnlock()
+
+	// Verify global analyzer received all observations
+	globalStats := proc.analyzer.GetStatistics()
+	assert.Equal(t, int64(10), globalStats.TotalBaseline)
+}
+
+func TestPartitionedAnalysis_DecayAppliedToAll(t *testing.T) {
+	t.Parallel()
+
+	proc := newTestProcessor(t, &Config{
+		AnomalyConditions: AnomalyConditionConfig{
+			AttributeName:  "anomaly.is_anomaly",
+			AttributeValue: "true",
+		},
+		AnalyzeAttributes: AnalyzeAttributesConfig{
+			Traces:   []string{"http.method"},
+			Resource: []string{"service.name"},
+		},
+		PartitionBy:           []string{"service.name"},
+		BaselineWindow:        10000,
+		MinAnomalySamples:     50,
+		MinBaselineSamples:    500,
+		OutputTopK:            5,
+		MinLift:               1.5,
+		MinConfidence:         0.95,
+		CardinalityLimit:      1000,
+		DecayFactor:           0.5, // Strong decay for testing
+		OutputAttributePrefix: "correlation",
+	})
+
+	// Process traces to create partitioned analyzer
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("service.name", "test-service")
+	ss := rs.ScopeSpans().AppendEmpty()
+	for i := 0; i < 100; i++ {
+		span := ss.Spans().AppendEmpty()
+		span.SetName("test-span")
+		span.Attributes().PutStr("http.method", "GET")
+		span.Attributes().PutBool("anomaly.is_anomaly", false)
+	}
+
+	_, err := proc.processTraces(context.Background(), td)
+	require.NoError(t, err)
+
+	// Get counts before decay
+	globalStatsBefore := proc.analyzer.GetStatistics()
+	proc.analyzerMutex.RLock()
+	partitionedAnalyzer := proc.partitionedAnalyzers["service.name=test-service"]
+	partitionedStatsBefore := partitionedAnalyzer.GetStatistics()
+	proc.analyzerMutex.RUnlock()
+
+	// Apply decay to global
+	proc.analyzer.ApplyDecay()
+	// Apply decay to partitioned
+	proc.analyzerMutex.RLock()
+	for _, analyzer := range proc.partitionedAnalyzers {
+		analyzer.ApplyDecay()
+	}
+	proc.analyzerMutex.RUnlock()
+
+	// Verify decay was applied to both
+	globalStatsAfter := proc.analyzer.GetStatistics()
+	proc.analyzerMutex.RLock()
+	partitionedStatsAfter := proc.partitionedAnalyzers["service.name=test-service"].GetStatistics()
+	proc.analyzerMutex.RUnlock()
+
+	// With decay factor of 0.5, counts should be halved
+	assert.Less(t, globalStatsAfter.TotalBaseline, globalStatsBefore.TotalBaseline)
+	assert.Less(t, partitionedStatsAfter.TotalBaseline, partitionedStatsBefore.TotalBaseline)
+}
+
+func TestGetOrCreatePartitionedAnalyzer_Concurrent(t *testing.T) {
+	t.Parallel()
+
+	proc := newTestProcessor(t, &Config{
+		AnomalyConditions: AnomalyConditionConfig{
+			AttributeName:  "anomaly.is_anomaly",
+			AttributeValue: "true",
+		},
+		AnalyzeAttributes: AnalyzeAttributesConfig{
+			Traces: []string{"http.method"},
+		},
+		PartitionBy:           []string{"service.name"},
+		BaselineWindow:        10000,
+		MinAnomalySamples:     50,
+		MinBaselineSamples:    500,
+		OutputTopK:            5,
+		MinLift:               1.5,
+		MinConfidence:         0.95,
+		CardinalityLimit:      1000,
+		DecayFactor:           0.95,
+		OutputAttributePrefix: "correlation",
+	})
+
+	// Concurrently get/create the same partition key
+	const numGoroutines = 100
+	done := make(chan *ContrastAnalyzer, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			analyzer := proc.getOrCreatePartitionedAnalyzer("service.name=test-service")
+			done <- analyzer
+		}()
+	}
+
+	// Collect all results
+	analyzers := make([]*ContrastAnalyzer, 0, numGoroutines)
+	for i := 0; i < numGoroutines; i++ {
+		analyzers = append(analyzers, <-done)
+	}
+
+	// Verify all goroutines got the same analyzer instance
+	firstAnalyzer := analyzers[0]
+	for i, analyzer := range analyzers {
+		assert.Same(t, firstAnalyzer, analyzer, "Goroutine %d got a different analyzer instance", i)
+	}
+
+	// Verify only one analyzer was created
+	proc.analyzerMutex.RLock()
+	assert.Equal(t, 1, len(proc.partitionedAnalyzers))
+	proc.analyzerMutex.RUnlock()
+}

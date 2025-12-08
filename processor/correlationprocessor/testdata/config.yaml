@@ -80,6 +80,32 @@ correlation/full:
   decay_factor: 0.98
   output_attribute_prefix: "contributing_factor"
 
+# Partitioned analysis by service and namespace
+correlation/partitioned:
+  anomaly_conditions:
+    attribute_name: "anomaly.is_anomaly"
+    attribute_value: "true"
+  analyze_attributes:
+    traces:
+      - http.method
+      - http.status_code
+    resource:
+      - service.name
+      - k8s.namespace.name
+  partition_by:
+    - service.name
+    - k8s.namespace.name
+  baseline_window: 10000
+  min_anomaly_samples: 50
+  min_baseline_samples: 500
+  output_top_k: 5
+  min_lift: 1.5
+  min_confidence: 0.95
+  cardinality_limit: 1000
+  decay_interval: "5m"
+  decay_factor: 0.95
+  output_attribute_prefix: "correlation"
+
 # Invalid: no anomaly condition
 correlation/no_condition:
   analyze_attributes:
