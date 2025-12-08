@@ -237,8 +237,10 @@ func (ca *ContrastAnalyzer) GetContributingFactors(topK int) []ContributingFacto
 			// Use symmetric thresholds: keep over-represented (lift >= MinLift)
 			// and under-represented (lift <= 1/MinLift) factors.
 			// For MinLift=1.5: keeps lift >= 1.5 or lift <= 0.667
+			// Note: lift=0 (value never appears in anomalies) is the strongest
+			// under-represented signal and should always be included.
 			meetsLiftThreshold := factor.Lift >= ca.config.MinLift ||
-				(factor.Lift > 0 && factor.Lift <= 1.0/ca.config.MinLift)
+				factor.Lift <= 1.0/ca.config.MinLift
 			if meetsLiftThreshold && factor.Confidence >= ca.config.MinConfidence {
 				allFactors = append(allFactors, factor)
 			}
