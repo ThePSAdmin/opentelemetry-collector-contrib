@@ -1,0 +1,223 @@
+# Default valid configuration
+correlation:
+  anomaly_conditions:
+    attribute_name: "anomaly.is_anomaly"
+    attribute_value: "true"
+  analyze_attributes:
+    traces:
+      - http.method
+      - http.status_code
+    metrics:
+      - service.name
+    logs:
+      - severity_text
+    resource:
+      - service.name
+      - deployment.environment
+  baseline_window: 10000
+  min_anomaly_samples: 50
+  min_baseline_samples: 500
+  output_top_k: 5
+  min_lift: 1.5
+  min_confidence: 0.95
+  cardinality_limit: 1000
+  decay_interval: "5m"
+  decay_factor: 0.95
+  output_attribute_prefix: "correlation"
+
+# Threshold-based anomaly detection
+correlation/threshold:
+  anomaly_conditions:
+    threshold_attribute: "anomaly.score"
+    threshold: 0.8
+    threshold_comparison: "gt"
+  analyze_attributes:
+    include_all: true
+    exclude:
+      - trace_id
+      - span_id
+  baseline_window: 5000
+  min_anomaly_samples: 25
+  min_baseline_samples: 250
+  output_top_k: 10
+  min_lift: 2.0
+  min_confidence: 0.99
+  cardinality_limit: 500
+  decay_interval: "10m"
+  decay_factor: 0.9
+  output_attribute_prefix: "corr"
+
+# Full configuration with all options
+correlation/full:
+  anomaly_conditions:
+    attribute_name: "error"
+    attribute_value: "true"
+    threshold_attribute: "latency_ms"
+    threshold: 1000
+    threshold_comparison: "gte"
+  analyze_attributes:
+    traces:
+      - http.method
+      - http.route
+      - rpc.method
+    metrics:
+      - host.name
+    logs:
+      - log.logger
+    resource:
+      - k8s.namespace.name
+      - k8s.deployment.name
+    include_all: false
+    exclude: []
+  baseline_window: 20000
+  min_anomaly_samples: 100
+  min_baseline_samples: 1000
+  output_top_k: 3
+  min_lift: 1.2
+  min_confidence: 0.90
+  cardinality_limit: 2000
+  decay_interval: "1m"
+  decay_factor: 0.98
+  output_attribute_prefix: "contributing_factor"
+
+# Partitioned analysis by service and namespace
+correlation/partitioned:
+  anomaly_conditions:
+    attribute_name: "anomaly.is_anomaly"
+    attribute_value: "true"
+  analyze_attributes:
+    traces:
+      - http.method
+      - http.status_code
+    resource:
+      - service.name
+      - k8s.namespace.name
+  partition_by:
+    - service.name
+    - k8s.namespace.name
+  baseline_window: 10000
+  min_anomaly_samples: 50
+  min_baseline_samples: 500
+  output_top_k: 5
+  min_lift: 1.5
+  min_confidence: 0.95
+  cardinality_limit: 1000
+  decay_interval: "5m"
+  decay_factor: 0.95
+  output_attribute_prefix: "correlation"
+
+# Invalid: no anomaly condition
+correlation/no_condition:
+  analyze_attributes:
+    traces:
+      - http.method
+  baseline_window: 10000
+  min_anomaly_samples: 50
+  min_baseline_samples: 500
+  output_top_k: 5
+  min_lift: 1.5
+  min_confidence: 0.95
+  cardinality_limit: 1000
+  output_attribute_prefix: "correlation"
+
+# Invalid: no attributes to analyze
+correlation/no_attributes:
+  anomaly_conditions:
+    attribute_name: "anomaly.is_anomaly"
+    attribute_value: "true"
+  analyze_attributes:
+    include_all: false
+  baseline_window: 10000
+  min_anomaly_samples: 50
+  min_baseline_samples: 500
+  output_top_k: 5
+  min_lift: 1.5
+  min_confidence: 0.95
+  cardinality_limit: 1000
+  output_attribute_prefix: "correlation"
+
+# Invalid: bad threshold comparison
+correlation/bad_comparison:
+  anomaly_conditions:
+    threshold_attribute: "score"
+    threshold: 0.5
+    threshold_comparison: "invalid"
+  analyze_attributes:
+    traces:
+      - http.method
+  baseline_window: 10000
+  min_anomaly_samples: 50
+  min_baseline_samples: 500
+  output_top_k: 5
+  min_lift: 1.5
+  min_confidence: 0.95
+  cardinality_limit: 1000
+  output_attribute_prefix: "correlation"
+
+# Invalid: negative baseline_window
+correlation/negative_window:
+  anomaly_conditions:
+    attribute_name: "anomaly.is_anomaly"
+    attribute_value: "true"
+  analyze_attributes:
+    traces:
+      - http.method
+  baseline_window: -1
+  min_anomaly_samples: 50
+  min_baseline_samples: 500
+  output_top_k: 5
+  min_lift: 1.5
+  min_confidence: 0.95
+  cardinality_limit: 1000
+  output_attribute_prefix: "correlation"
+
+# Invalid: min_baseline_samples < min_anomaly_samples
+correlation/invalid_samples:
+  anomaly_conditions:
+    attribute_name: "anomaly.is_anomaly"
+    attribute_value: "true"
+  analyze_attributes:
+    traces:
+      - http.method
+  baseline_window: 10000
+  min_anomaly_samples: 500
+  min_baseline_samples: 50
+  output_top_k: 5
+  min_lift: 1.5
+  min_confidence: 0.95
+  cardinality_limit: 1000
+  output_attribute_prefix: "correlation"
+
+# Invalid: confidence out of range
+correlation/invalid_confidence:
+  anomaly_conditions:
+    attribute_name: "anomaly.is_anomaly"
+    attribute_value: "true"
+  analyze_attributes:
+    traces:
+      - http.method
+  baseline_window: 10000
+  min_anomaly_samples: 50
+  min_baseline_samples: 500
+  output_top_k: 5
+  min_lift: 1.5
+  min_confidence: 1.5
+  cardinality_limit: 1000
+  output_attribute_prefix: "correlation"
+
+# Invalid: empty output prefix
+correlation/empty_prefix:
+  anomaly_conditions:
+    attribute_name: "anomaly.is_anomaly"
+    attribute_value: "true"
+  analyze_attributes:
+    traces:
+      - http.method
+  baseline_window: 10000
+  min_anomaly_samples: 50
+  min_baseline_samples: 500
+  output_top_k: 5
+  min_lift: 1.5
+  min_confidence: 0.95
+  cardinality_limit: 1000
+  output_attribute_prefix: ""
